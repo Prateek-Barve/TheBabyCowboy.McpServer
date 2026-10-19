@@ -1,0 +1,99 @@
+trigger:
+  branches:
+    include:
+      - master
+
+variables:
+  azureSubscription: 'Azure-Subscription-Conn'
+  resourceGroup: 'rg-thebabycowboy'
+  location: 'centralindia' # Hosted in Central India (Pune)
+  webAppName: 'thebabycowboy-mcp'
+  buildConfiguration: 'Release'
+
+stages:
+# STAGE 1: Provision Infrastructure using Bicep via Azure CLI
+- stage: Infra
+  displayName: '1. Provision Infrastructure in India'
+  jobs:
+  - job: DeployBicep
+    pool:
+      vmImage: 'windows-latest'
+    steps:
+    - task: AzureCLI@2
+      displayName: 'Provision Free Windows App Service (Central India)'
+      inputs:
+        azureSubscription: '$(azureSubscription)'
+        scriptType: 'ps'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          Write-Host "Current Directory:"
+          Get-Location
+          
+          Write-Host "Checking Bicep file presence:"
+          Get-ChildItem -Path . -Recurse -Filter "main.bicep" | Select-Object FullName
+          
+          # Deploy Bicep resource group deployment
+          az deployment group create `
+            --resource-group "$(resourceGroup)" `
+            --template-file "./TheBabyCowboy.McpServer/Infra/main.bicep"
+
+- stage: Build
+  displayName: '2. Build & Package API'
+  dependsOn: Infra
+  jobs:
+  - job: BuildJob
+    pool:
+      vmImage: 'windows-latest'
+    steps:
+    - task: UseDotNet@2
+      displayName: 'Install .NET SDK'
+      inputs:
+        packageType: 'sdk'
+        version: '9.x'
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Restore Dependencies'
+      inputs:
+        command: 'restore'
+        projects: '**/*.csproj'
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Publish Web API'
+      inputs:
+        command: 'publish'
+        publishWebProjects: true
+        arguments: '--configuration $(buildConfiguration) --output $(Build.ArtifactStagingDirectory)'
+        zipAfterPublish: true
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Upload Artifact'
+      inputs:
+        targetPath: '$(Build.ArtifactStagingDirectory)'
+        artifact: 'drop'
+
+- stage: Deploy
+  displayName: '3. Deploy to Azure'
+  dependsOn: Build
+  condition: succeeded()
+  jobs:
+  - deployment: DeployJob
+    pool:
+      vmImage: 'windows-latest'
+    environment: 'production'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              buildType: 'current'
+              artifactName: 'drop'
+              targetPath: '$(Pipeline.Workspace)/drop'
+
+          - task: AzureWebApp@1
+            displayName: 'Deploy Code to Azure App Service'
+            inputs:
+              azureSubscription: '$(azureSubscription)'
+              appType: 'webApp' # Windows App Service
+              appName: '$(webAppName)'
+              package: '$(Pipeline.Workspace)/drop/*.zip'
